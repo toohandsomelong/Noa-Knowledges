@@ -1,0 +1,6 @@
+deepseek:
+  base_url: https://api.deepseek.com
+  generator_model: deepseek-flash
+  judge_model: deepseek-v4-pro
+  thinking: disabled
+  temperature: 0.0

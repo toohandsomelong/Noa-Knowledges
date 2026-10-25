@@ -1,0 +1,15 @@
+kg:
+  max_articles: null
+
+walks:
+  depth: 3
+  walks_per_node: 60
+  max_walks_per_node_bfs: 20
+
+retrieval:
+  top_k_nodes: 3
+  top_k_walks: 3
+  max_context_tokens: 4096
+
+eval:
+  questions_path: data/qa/questions_test.jsonl

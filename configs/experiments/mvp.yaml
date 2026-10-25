@@ -1,0 +1,18 @@
+kg:
+  max_articles: 2
+  article_ids:
+    - "Điều 13"
+    - "Điều 18"
+
+walks:
+  depth: 2
+  walks_per_node: 10
+  max_walks_per_node_bfs: 10
+
+retrieval:
+  top_k_nodes: 2
+  top_k_walks: 2
+  max_context_tokens: 2048
+
+eval:
+  questions_path: data/qa/questions_mvp.jsonl

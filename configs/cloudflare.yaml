@@ -1,0 +1,7 @@
+cloudflare:
+  chat_model: "@cf/meta/llama-3.1-8b-instruct-fp8-fast"
+  embedding_model: "@cf/baai/bge-m3"
+  embedding_dim: 1024
+
+quota:
+  daily_neuron_limit: 9000
