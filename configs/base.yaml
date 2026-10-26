@@ -1,5 +1,5 @@
 project:
-  name: noa-kgrag
+  name: kgrag
   seed: 42
   data_dir: data
   artifact_dir: artifacts
