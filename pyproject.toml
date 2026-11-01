@@ -11,7 +11,8 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
-export = ["markitdown[pdf]>=0.1.0"]
+# export = ["markitdown[docx,pptx,xlsx]>=0.1.0", "pypdfium2>=5.0"]
+export = ["pypdfium2>=5.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

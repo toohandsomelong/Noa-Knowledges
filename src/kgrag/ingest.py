@@ -1,25 +1,19 @@
-"""Parse the Vietnamese regulation source into hierarchical DocumentUnits."""
+"""Parse Vietnamese regulation sources into hierarchical DocumentUnits."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 from collections import defaultdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from kgrag.schemas import DocumentUnit, ParseResult, SourceSpan
-
-_CHAPTER_RE = re.compile(r"^Chương\s+([IVXLCDM]+)\s*$")
-_ARTICLE_RE = re.compile(r"^Điều\s+(\d+[a-zA-Z]*)\.\s*(.*)$")
-_CLAUSE_RE = re.compile(r"^(\d+)\.\s+(.*)$")
-_POINT_RE = re.compile(r"^([a-z])\)\s+(.*)$")
-_DASH_RE = re.compile(r"^[-–]\s+(.*)$")
-_TABLE_ROW_RE = re.compile(r"^\|.*\|$")
-_TABLE_SEP_RE = re.compile(r"^\|[-:\s|]+\|$")
-_CROSSREF_DIEU_RE = re.compile(r"(?:Điều|điều)\s+(\d+[a-zA-Z]*)")
-_CROSSREF_KHOAN_RE = re.compile(r"(?:Khoản|khoản)\s+(\d+)")
-_CROSSREF_DIEM_RE = re.compile(r"(?:Điểm|điểm)\s+([a-z])\)")
+from kgrag.ingest_normalize import NormalizedLine, normalize_text
+from kgrag.ingest_profile import ParserProfile, vietnamese_regulation_profile
+from kgrag.schemas import DocumentUnit, ParseResult, Reference, SourceSpan
 
 _LEVEL_RANK = {
     "document": 0,
@@ -31,6 +25,32 @@ _LEVEL_RANK = {
     "table": 6,
     "table_row": 7,
 }
+
+_PARENT_RANK_GATE = {
+    "section": -1,
+    "chapter": 0,
+    "article": 0,
+    "clause": 2,
+    "point": 3,
+    "subpoint": 4,
+    "table": 0,
+}
+
+
+@dataclass(frozen=True)
+class _Token:
+    kind: str
+    value: str
+    text: str
+    line: NormalizedLine
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _slug(value: str) -> str:
@@ -75,51 +95,175 @@ def load_source_text(path: str | Path | None = None) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _extract_crossrefs(text: str) -> dict[str, list[str]]:
-    return {
-        "dieu": _CROSSREF_DIEU_RE.findall(text),
-        "khoan": _CROSSREF_KHOAN_RE.findall(text),
-        "diem": _CROSSREF_DIEM_RE.findall(text),
-    }
+def load_source(
+    path: str | Path | None = None,
+) -> tuple[str, Path, str, str]:
+    """Load source text and return text, path, format, and SHA-256 hash."""
+    if path is None:
+        candidate = _find_default_source()
+        if candidate is None:
+            raise FileNotFoundError(
+                "Could not discover regulation source. "
+                "Set SOURCE_TEXT or pass an explicit path."
+            )
+        path = candidate
+    path = Path(path)
+    text = path.read_text(encoding="utf-8")
+    source_format = path.suffix.lower().lstrip(".") or "txt"
+    source_hash = _sha256_file(path)
+    return text, path, source_format, source_hash
+
+
+def _allowed_here(kind: str, current_rank: int) -> bool:
+    if current_rank < 0:
+        return kind in ("section", "chapter", "article")
+    return current_rank >= _PARENT_RANK_GATE[kind]
+
+
+def _point_pattern_for_style(style: str) -> str:
+    style = style.strip()
+    if len(style) == 2 and style[0].isalpha() and style[1] == ")":
+        return r"^([a-zA-Z])\)\s+(?P<text>.*)$"
+    if len(style) == 2 and style[0].isalpha() and style[1] == ".":
+        return r"^([a-zA-Z])\.\s+(?P<text>.*)$"
+    if len(style) == 3 and style[0] == "(" and style[2] == ")":
+        return r"^\(([a-zA-Z])\)\s+(?P<text>.*)$"
+    return ""
+
+
+def _point_patterns(profile: ParserProfile) -> list[re.Pattern[str]]:
+    patterns = []
+    for style in profile.point_styles:
+        raw = _point_pattern_for_style(style)
+        if raw:
+            patterns.append(re.compile(raw))
+    return patterns
+
+
+def _match_point(stripped: str, profile: ParserProfile) -> tuple[str, str] | None:
+    for pattern in _point_patterns(profile):
+        match = pattern.match(stripped)
+        if match:
+            letter = next(g for g in match.groups() if g is not None)
+            return letter, match.group("text").strip()
+    return None
+
+
+def _structural_appearance(line: NormalizedLine, profile: ParserProfile) -> str | None:
+    stripped = line.text
+    if profile.section_markers.get(stripped):
+        return "section"
+    if profile.chapter_re().match(stripped):
+        return "chapter"
+    if profile.article_re().match(stripped):
+        return "article"
+    if profile.clause_re().match(stripped):
+        return "clause"
+    if _match_point(stripped, profile):
+        return "point"
+    if profile.subpoint_re().match(stripped):
+        return "subpoint"
+    return None
+
+
+def _detect_token(
+    line: NormalizedLine,
+    profile: ParserProfile,
+    current_rank: int,
+) -> _Token | None:
+    stripped = line.text
+
+    marker_ns = profile.section_markers.get(stripped)
+    if marker_ns is not None:
+        return _Token(kind="section", value=marker_ns, text=stripped, line=line)
+
+    chapter_match = profile.chapter_re().match(stripped)
+    if chapter_match:
+        return _Token(
+            kind="chapter",
+            value=chapter_match.group(2),
+            text=chapter_match.group(3) or "",
+            line=line,
+        )
+
+    article_match = profile.article_re().match(stripped)
+    if article_match and _allowed_here("article", current_rank):
+        return _Token(
+            kind="article",
+            value=article_match.group(2),
+            text=article_match.group(3).strip(),
+            line=line,
+        )
+
+    clause_match = profile.clause_re().match(stripped)
+    if clause_match and _allowed_here("clause", current_rank):
+        return _Token(
+            kind="clause",
+            value=clause_match.group(1),
+            text=clause_match.group(2).strip(),
+            line=line,
+        )
+
+    point_text = _match_point(stripped, profile)
+    if point_text is not None and _allowed_here("point", current_rank):
+        letter, text = point_text
+        return _Token(kind="point", value=letter, text=text, line=line)
+
+    subpoint_match = profile.subpoint_re().match(stripped)
+    if subpoint_match and _allowed_here("subpoint", current_rank):
+        return _Token(
+            kind="subpoint",
+            value="",
+            text=subpoint_match.group(1).strip(),
+            line=line,
+        )
+
+    if profile.table_re().match(stripped):
+        return _Token(kind="table", value="", text=stripped, line=line)
+
+    return None
 
 
 def parse_regulation(
     text: str,
     *,
     document_id: str = "quyche-2026",
-    source_path: str = "",
+    source_file: str = "",
+    source_format: str = "txt",
+    source_hash: str = "",
+    profile: ParserProfile | None = None,
+    strict: bool = True,
     article_ids: set[str] | None = None,
     include_chapters: bool = True,
 ) -> ParseResult:
-    """Parse *text* into a hierarchical list of DocumentUnits.
-
-    Args:
-        text: Full source text.
-        document_id: Identifier for the whole document.
-        source_path: Optional source file path for provenance.
-        article_ids: If given, keep only units under these article numbers
-            (e.g. {"13", "18"}). Chapter ancestors are kept for context.
-        include_chapters: If True, include chapter units in the output.
-    """
-    lines = text.splitlines()
+    """Parse *text* into a hierarchical list of DocumentUnits."""
+    profile = profile or vietnamese_regulation_profile()
+    lines = normalize_text(text)
     units: list[DocumentUnit] = []
     stack: list[DocumentUnit] = []
     orders: dict[tuple[str | None, str], int] = defaultdict(int)
 
-    current_prefix = "decision"
+    prefix = profile.default_namespace
     pending_chapter: dict[str, Any] | None = None
-    in_table = False
     table_unit: DocumentUnit | None = None
+    in_table = False
+
     preamble_lines: list[str] = []
     preamble_span: SourceSpan | None = None
+    warnings: list[str] = []
 
     def _next_order(parent_id: str | None, level: str) -> int:
         key = (parent_id, level)
         orders[key] += 1
         return orders[key]
 
+    def _current_rank() -> int:
+        if not stack:
+            return -1
+        return _LEVEL_RANK.get(stack[-1].level, -1)
+
     def _pop_to(rank: int) -> DocumentUnit | None:
-        while stack and _LEVEL_RANK[stack[-1].level] >= rank:
+        while stack and _LEVEL_RANK.get(stack[-1].level, -1) >= rank:
             stack.pop()
         return stack[-1] if stack else None
 
@@ -134,13 +278,12 @@ def parse_regulation(
         level: str,
         title: str,
         text: str,
-        line_index: int,
+        line: NormalizedLine,
         parent: DocumentUnit | None = None,
         extra_id_parts: Sequence[str] = (),
         level_meta: dict[str, Any] | None = None,
     ) -> DocumentUnit:
         nonlocal in_table, table_unit
-
         if in_table and level not in ("table", "table_row"):
             _close_table()
 
@@ -149,7 +292,7 @@ def parse_regulation(
         parent_id = parent.id if parent else None
         order = _next_order(parent_id, level)
 
-        id_parts = [current_prefix]
+        id_parts = [prefix]
         if parent:
             id_parts = parent.id.split(":")
         id_parts = list(id_parts)
@@ -157,14 +300,15 @@ def parse_regulation(
         unit_id = ":".join(id_parts)
 
         span = SourceSpan(
-            start_line=line_index + 1,
-            end_line=line_index + 1,
+            start_line=line.line_no,
+            end_line=line.line_no,
             start_char=0,
-            end_char=len(lines[line_index]) if line_index < len(lines) else 0,
+            end_char=len(line.original),
         )
         meta: dict[str, Any] = {}
         if level_meta:
             meta.update(level_meta)
+
         unit = DocumentUnit(
             id=unit_id,
             document_id=document_id,
@@ -175,32 +319,34 @@ def parse_regulation(
             context_text="",
             order=order,
             source_span=span,
+            source_file=source_file,
+            source_format=source_format,
+            source_hash=source_hash,
+            raw_text=line.text,
+            citation_label="",
             metadata=meta,
         )
         units.append(unit)
         stack.append(unit)
         return unit
 
-    def _append_to_top(text: str, line_index: int) -> None:
+    def _append_to_top(line: NormalizedLine) -> None:
         nonlocal in_table, table_unit
         if not stack:
-            preamble_lines.append(text)
+            preamble_lines.append(line.text)
             return
-
         if stack[-1].level in ("table", "table_row"):
             _close_table()
-
         if not stack:
-            preamble_lines.append(text)
+            preamble_lines.append(line.text)
             return
-
         unit = stack[-1]
-        unit.text = f"{unit.text} {text}".strip()
+        unit.text = f"{unit.text} {line.text}".strip()
         unit.source_span = SourceSpan(
             start_line=unit.source_span.start_line,
-            end_line=line_index + 1,
+            end_line=line.line_no,
             start_char=unit.source_span.start_char,
-            end_char=len(lines[line_index]) if line_index < len(lines) else 0,
+            end_char=len(line.original),
         )
 
     def _flush_preamble() -> None:
@@ -210,7 +356,7 @@ def parse_regulation(
         span = preamble_span or SourceSpan(1, 1)
         units.append(
             DocumentUnit(
-                id=f"{current_prefix}:preamble",
+                id=f"{prefix}:preamble",
                 document_id=document_id,
                 level="preamble",
                 parent_id=None,
@@ -219,172 +365,160 @@ def parse_regulation(
                 context_text=text,
                 order=_next_order(None, "preamble"),
                 source_span=span,
+                source_file=source_file,
+                source_format=source_format,
+                source_hash=source_hash,
+                raw_text=text,
+                citation_label="",
                 metadata={},
             )
         )
         preamble_lines.clear()
 
-    for idx, raw in enumerate(lines):
-        line = raw.rstrip()
-        stripped = line.strip()
+    def _create_chapter(
+        number: str,
+        title: str,
+        start_line: NormalizedLine,
+    ) -> DocumentUnit:
+        return _add_unit(
+            level="chapter",
+            title=title,
+            text=title,
+            line=start_line,
+            extra_id_parts=[f"chuong-{_slug(number)}"],
+            level_meta={"chapter_number": number},
+        )
+
+    for line in lines:
+        stripped = line.text
 
         if preamble_span is None and not stripped:
             continue
         if preamble_span is None and stripped:
-            preamble_span = SourceSpan(idx + 1, idx + 1)
+            preamble_span = SourceSpan(line.line_no, line.line_no)
 
-        if stripped == "QUY CHẾ":
+        if pending_chapter is not None and stripped:
+            appearance = _structural_appearance(line, profile)
+            if appearance in ("section", "chapter", "article"):
+                _create_chapter(pending_chapter["number"], pending_chapter["number"], pending_chapter["line"])
+            else:
+                _create_chapter(pending_chapter["number"], stripped, pending_chapter["line"])
+            pending_chapter = None
+            if appearance in ("section", "chapter", "article"):
+                pass
+            else:
+                continue
+
+        token = _detect_token(line, profile, _current_rank())
+
+        if token is None:
+            appearance = _structural_appearance(line, profile)
+            if appearance and strict:
+                warnings.append(
+                    f"line {line.line_no} looks like {appearance} "
+                    f"but is not valid in the current context"
+                )
+            if not stripped:
+                continue
+            _append_to_top(line)
+            continue
+
+        if token.kind == "section":
             _flush_preamble()
             _close_table()
             stack.clear()
-            current_prefix = "regulation"
+            prefix = token.value
             continue
 
-        if not stripped:
-            continue
-
-        chapter_match = _CHAPTER_RE.match(stripped)
-        if chapter_match:
+        if token.kind == "chapter":
             _flush_preamble()
-            pending_chapter = {
-                "number": chapter_match.group(1),
-                "title_lines": [],
-                "start_line": idx + 1,
-            }
-            continue
-
-        if pending_chapter is not None:
-            pending_chapter["title_lines"].append(stripped)
-            if len(pending_chapter["title_lines"]) >= 1 and (
-                _ARTICLE_RE.match(stripped)
-                or _CHAPTER_RE.match(stripped)
-                or idx + 1 >= len(lines)
-            ):
-                pending_chapter["title_lines"].pop()
-            if pending_chapter["title_lines"]:
-                title = " ".join(pending_chapter["title_lines"])
-                chapter_id_part = f"chuong-{_slug(pending_chapter['number'])}"
-                _pop_to(_LEVEL_RANK["chapter"])
-                parent = stack[-1] if stack else None
-                _add_unit(
-                    level="chapter",
-                    title=title,
-                    text=title,
-                    line_index=pending_chapter["start_line"] - 1,
-                    parent=parent,
-                    extra_id_parts=[chapter_id_part],
-                    level_meta={"chapter_number": pending_chapter["number"]},
-                )
-                pending_chapter = None
-            continue
-
-        article_match = _ARTICLE_RE.match(stripped)
-        if article_match:
-            _flush_preamble()
-            _close_table()
-            article_number = article_match.group(1)
-            title = article_match.group(2).strip()
-            if current_prefix == "regulation":
-                _pop_to(_LEVEL_RANK["article"])
+            if token.text:
+                _create_chapter(token.value, token.text, token.line)
             else:
-                stack.clear()
-            parent = stack[-1] if stack else None
+                pending_chapter = {"number": token.value, "line": token.line}
+            continue
+
+        if token.kind == "article":
+            _flush_preamble()
             _add_unit(
                 level="article",
-                title=title,
-                text=title,
-                line_index=idx,
-                parent=parent,
-                extra_id_parts=[f"dieu-{_slug(article_number)}"],
-                level_meta={"article_number": article_number},
+                title=token.text,
+                text=token.text,
+                line=token.line,
+                extra_id_parts=[f"dieu-{_slug(token.value)}"],
+                level_meta={"article_number": token.value},
             )
             continue
 
-        if in_table or _TABLE_ROW_RE.match(stripped):
-            if _TABLE_SEP_RE.match(stripped):
-                continue
-            if not _TABLE_ROW_RE.match(stripped):
-                # A non-table line ends the current table; let normal parsing handle it.
-                _close_table()
-            else:
-                if not in_table:
-                    _close_table()
-                    parent = _pop_to(_LEVEL_RANK["table"])
-                    table_order = _next_order(parent.id if parent else None, "table")
-                    table_unit = _add_unit(
-                        level="table",
-                        title="",
-                        text="",
-                        line_index=idx,
-                        parent=parent,
-                        extra_id_parts=[f"bang-{table_order}"],
-                    )
-                    table_unit.metadata["header"] = stripped
-                    in_table = True
-                    continue
-
-                assert table_unit is not None
-                row_text = stripped
-                cells = [cell.strip() for cell in stripped.split("|")[1:-1]]
-                _pop_to(_LEVEL_RANK["table_row"])
-                row = _add_unit(
-                    level="table_row",
-                    title="",
-                    text=row_text,
-                    line_index=idx,
-                    parent=table_unit,
-                    extra_id_parts=[f"hang-{len([u for u in units if u.parent_id == table_unit.id]) + 1}"],
-                )
-                row.metadata["cells"] = cells
-                continue
-
-        clause_match = _CLAUSE_RE.match(stripped)
-        if clause_match:
-            number = clause_match.group(1)
-            text = clause_match.group(2).strip()
+        if token.kind == "clause":
             _add_unit(
                 level="clause",
                 title="",
-                text=text,
-                line_index=idx,
-                extra_id_parts=[f"khoan-{_slug(number)}"],
-                level_meta={"clause_number": number},
+                text=token.text,
+                line=token.line,
+                extra_id_parts=[f"khoan-{_slug(token.value)}"],
+                level_meta={"clause_number": token.value},
             )
             continue
 
-        point_match = _POINT_RE.match(stripped)
-        if point_match:
-            letter = point_match.group(1)
-            text = point_match.group(2).strip()
+        if token.kind == "point":
             _add_unit(
                 level="point",
                 title="",
-                text=text,
-                line_index=idx,
-                extra_id_parts=[f"diem-{letter}"],
-                level_meta={"point_letter": letter},
+                text=token.text,
+                line=token.line,
+                extra_id_parts=[f"diem-{token.value.lower()}"],
+                level_meta={"point_letter": token.value},
             )
             continue
 
-        dash_match = _DASH_RE.match(stripped)
-        if dash_match:
-            text = dash_match.group(1).strip()
+        if token.kind == "subpoint":
             _add_unit(
                 level="subpoint",
                 title="",
-                text=text,
-                line_index=idx,
-                extra_id_parts=[f"muc-{_slug(text[:20])}"],
+                text=token.text,
+                line=token.line,
+                extra_id_parts=[f"muc-{_slug(token.text[:40])}-dong{token.line.line_no}"],
             )
             continue
 
-        _append_to_top(stripped, idx)
+        if token.kind == "table":
+            if profile.table_separator_re().match(stripped):
+                continue
+            if not in_table:
+                _close_table()
+                table_unit = _add_unit(
+                    level="table",
+                    title="",
+                    text="",
+                    line=token.line,
+                    extra_id_parts=[f"bang-{_next_order(None, 'table')}"],
+                )
+                table_unit.metadata["header"] = stripped
+                in_table = True
+            else:
+                if table_unit is None:
+                    continue
+                row_index = len([u for u in units if u.parent_id == table_unit.id]) + 1
+                row = _add_unit(
+                    level="table_row",
+                    title="",
+                    text=stripped,
+                    line=token.line,
+                    parent=table_unit,
+                    extra_id_parts=[f"hang-{row_index}"],
+                )
+                row.metadata["cells"] = [cell.strip() for cell in stripped.split("|")[1:-1]]
+            continue
 
     _flush_preamble()
     _close_table()
 
+    if pending_chapter is not None:
+        _create_chapter(pending_chapter["number"], pending_chapter["number"], pending_chapter["line"])
+
     _build_context_text(units)
-    _enrich_metadata(units)
+    _enrich_metadata(units, profile)
 
     if article_ids is not None:
         keep_ids = _closure_for_articles(units, article_ids)
@@ -394,9 +528,14 @@ def parse_regulation(
         units = [u for u in units if u.level != "chapter"]
 
     metadata = {
-        "source_path": source_path,
+        "source_file": source_file,
+        "source_format": source_format,
+        "source_hash": source_hash,
+        "profile": profile.name,
+        "document_id": document_id,
         "article_count": len([u for u in units if u.level == "article"]),
         "unit_count": len(units),
+        "warnings": warnings,
     }
     return ParseResult(document_id=document_id, units=units, metadata=metadata)
 
@@ -423,9 +562,54 @@ def _build_context_text(units: list[DocumentUnit]) -> None:
         unit.context_text = "\n".join(context_lines).strip()
 
 
-def _enrich_metadata(units: list[DocumentUnit]) -> None:
+def _enrich_metadata(units: list[DocumentUnit], profile: ParserProfile) -> None:
+    crossref_res = profile.crossref_res()
+    by_id = {u.id: u for u in units}
+
+    def _ancestors(unit: DocumentUnit) -> list[DocumentUnit]:
+        result = []
+        current = by_id.get(unit.parent_id) if unit.parent_id else None
+        while current is not None:
+            result.insert(0, current)
+            current = by_id.get(current.parent_id) if current.parent_id else None
+        return result
+
+    article_number = ""
+    clause_number = ""
+    point_letter = ""
     for unit in units:
-        unit.metadata["crossrefs"] = _extract_crossrefs(unit.text)
+        if unit.level == "article":
+            article_number = unit.metadata.get("article_number", "")
+        elif unit.level == "clause":
+            clause_number = unit.metadata.get("clause_number", "")
+        elif unit.level == "point":
+            point_letter = unit.metadata.get("point_letter", "")
+
+        references: list[Reference] = []
+        for kind, pattern in crossref_res.items():
+            for match in pattern.finditer(unit.text):
+                references.append(
+                    Reference(kind=kind, target=match.group(2), text=match.group(0))
+                )
+        unit.metadata["references"] = [asdict(ref) for ref in references]
+
+        label_parts = []
+        if article_number:
+            label_parts.append(f"Điều {article_number}")
+        if clause_number:
+            label_parts.append(f"khoản {clause_number}")
+        if point_letter:
+            label_parts.append(f"điểm {point_letter}")
+        unit.citation_label = " ".join(label_parts)
+
+        if not unit.citation_label:
+            ancestors = _ancestors(unit)
+            nearest = next(
+                (a for a in reversed(ancestors) if a.citation_label),
+                None,
+            )
+            if nearest:
+                unit.citation_label = nearest.citation_label
 
 
 def _closure_for_articles(units: list[DocumentUnit], article_ids: set[str]) -> set[str]:
@@ -445,10 +629,66 @@ def _closure_for_articles(units: list[DocumentUnit], article_ids: set[str]) -> s
     return keep
 
 
-def _is_descendant(unit: DocumentUnit, ancestor: DocumentUnit, by_id: dict[str, DocumentUnit]) -> bool:
+def _is_descendant(
+    unit: DocumentUnit, ancestor: DocumentUnit, by_id: dict[str, DocumentUnit]
+) -> bool:
     current = by_id.get(unit.parent_id) if unit.parent_id else None
     while current is not None:
         if current.id == ancestor.id:
             return True
         current = by_id.get(current.parent_id) if current.parent_id else None
     return False
+
+
+def parse_source_file(
+    path: str | Path,
+    *,
+    document_id: str = "quyche-2026",
+    profile: ParserProfile | None = None,
+    strict: bool = True,
+    article_ids: set[str] | None = None,
+    include_chapters: bool = True,
+) -> ParseResult:
+    """Parse a single source file, computing format and hash automatically."""
+    path = Path(path)
+    text, _, source_format, source_hash = load_source(path)
+    return parse_regulation(
+        text,
+        document_id=document_id,
+        source_file=path.as_posix(),
+        source_format=source_format,
+        source_hash=source_hash,
+        profile=profile,
+        strict=strict,
+        article_ids=article_ids,
+        include_chapters=include_chapters,
+    )
+
+
+def save_units_jsonl(units: list[DocumentUnit], path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for unit in units:
+            handle.write(json.dumps(unit.to_dict(), ensure_ascii=False))
+            handle.write("\n")
+
+
+def load_units_jsonl(path: str | Path) -> list[DocumentUnit]:
+    path = Path(path)
+    units: list[DocumentUnit] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            units.append(DocumentUnit(**data))
+    return units
+
+
+def save_parse_report(result: ParseResult, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(result.to_dict(), handle, ensure_ascii=False, indent=2)

@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
-from kgrag.ingest import load_source_text, parse_regulation
+from kgrag.ingest import (
+    load_source_text,
+    load_units_jsonl,
+    parse_regulation,
+    parse_source_file,
+    save_parse_report,
+    save_units_jsonl,
+)
 
 
 @pytest.fixture(scope="module")
@@ -119,7 +129,7 @@ def test_mvp_filter_includes_only_requested_articles():
 
 
 def test_crossrefs_extracted(parsed):
-    units_with_refs = [u for u in parsed.units if any(u.metadata["crossrefs"].values())]
+    units_with_refs = [u for u in parsed.units if u.metadata.get("references")]
     assert units_with_refs
 
 
@@ -133,3 +143,112 @@ def test_point_letters_parsed(parsed):
     letters = {u.metadata["point_letter"] for u in points}
     assert "a" in letters
     assert "b" in letters
+
+
+def test_markdown_export_parses_identically():
+    md_path = Path("data/processed/docs/Toàn văn quy chế đào tạo theo tín chỉ.md")
+    txt_result = parse_regulation(load_source_text())
+    md_result = parse_source_file(md_path)
+
+    txt_ids = [u.id for u in txt_result.units]
+    md_ids = [u.id for u in md_result.units]
+    assert txt_ids == md_ids
+
+
+def test_markdown_headings_and_bold_are_normalized():
+    text = "\n".join(
+        [
+            "## Điều 1. Phạm vi",
+            "1. Quy chế này áp dụng...",
+            "**Điều 2: Đối tượng**",
+            "1. Sinh viên.",
+            "a) Các hệ chính quy.",
+            "A) Hệ thường xuyên.",
+        ]
+    )
+    result = parse_regulation(text, strict=False)
+    articles = [u for u in result.units if u.level == "article"]
+    points = [u for u in result.units if u.level == "point"]
+    assert len(articles) == 2
+    assert len(points) == 2
+
+
+def test_alternate_punctuation_styles():
+    text = "\n".join(
+        [
+            "Điều 1. Tiêu đề",
+            "1: Một",
+            "2. Hai",
+            "a. Ba",
+            "(b) Bốn",
+            "- Năm",
+            "+ Sáu",
+        ]
+    )
+    result = parse_regulation(text, strict=False)
+    assert len([u for u in result.units if u.level == "clause"]) == 2
+    assert len([u for u in result.units if u.level == "point"]) == 2
+    assert len([u for u in result.units if u.level == "subpoint"]) == 2
+
+
+def test_strict_mode_records_warnings():
+    result = parse_regulation(load_source_text(), strict=True)
+    assert result.metadata["warnings"]
+    assert any("line 37" in w for w in result.metadata["warnings"])
+
+
+def test_strict_mode_disabled_allows_continuations():
+    result = parse_regulation(load_source_text(), strict=False)
+    assert not result.metadata["warnings"]
+
+
+def test_table_ownership(parsed):
+    tables = [u for u in parsed.units if u.level == "table"]
+    rows = [u for u in parsed.units if u.level == "table_row"]
+    assert tables
+    assert rows
+    for row in rows:
+        parent = next(u for u in parsed.units if u.id == row.parent_id)
+        assert parent.level == "table"
+    for table in tables:
+        assert table.parent_id is not None
+
+
+def test_citation_labels(parsed):
+    labels = [u.citation_label for u in parsed.units if u.citation_label]
+    assert any("Điều 13" in label for label in labels)
+    assert any("khoản 3" in label for label in labels)
+
+
+def test_muc_reference_extracted(parsed):
+    refs = [
+        ref
+        for u in parsed.units
+        for ref in u.metadata.get("references", [])
+        if ref["kind"] == "muc"
+    ]
+    assert refs
+
+
+def test_jsonl_roundtrip(tmp_path):
+    result = parse_regulation(load_source_text())
+    jsonl_path = tmp_path / "units.jsonl"
+    save_units_jsonl(result.units, jsonl_path)
+    loaded = load_units_jsonl(jsonl_path)
+    assert [u.id for u in loaded] == [u.id for u in result.units]
+
+
+def test_parse_source_file_sets_hash_and_path():
+    source_path = Path("data/docs/Toàn văn quy chế đào tạo theo tín chỉ.txt")
+    result = parse_source_file(source_path)
+    assert result.metadata["source_hash"]
+    assert result.units[0].source_file.endswith(".txt")
+
+
+def test_save_parse_report(tmp_path):
+    result = parse_regulation(load_source_text())
+    report_path = tmp_path / "report.json"
+    save_parse_report(result, report_path)
+    data = json.loads(report_path.read_text(encoding="utf-8"))
+    assert data["document_id"] == result.document_id
+    assert data["metadata"]["unit_count"] == len(result.units)
