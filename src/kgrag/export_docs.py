@@ -1,6 +1,4 @@
-"""Export documents from a source directory to text or Markdown."""
-
-# DO NOT DELETE
+"""Export documents from a source directory to structured JSON or Markdown."""
 
 from __future__ import annotations
 
@@ -19,16 +17,6 @@ _DEFAULT_MANIFEST = _REPO_ROOT / "data" / "processed" / "docs_manifest.jsonl"
 
 _PASSTHROUGH_SUFFIXES = {".txt", ".md"}
 _PDF_SUFFIX = ".pdf"
-# _MARKITDOWN_SUFFIXES = {
-#     ".csv",
-#     ".docx",
-#     ".htm",
-#     ".html",
-#     ".json",
-#     ".pptx",
-#     ".xlsx",
-#     ".xml",
-# }
 
 
 def _sha256(path: Path) -> str:
@@ -46,70 +34,104 @@ def _package_version(name: str) -> str:
         return "unavailable"
 
 
-# def _extract_markdown(result: Any) -> str:
-#     for attribute in ("markdown", "text_content"):
-#         value = getattr(result, attribute, None)
-#         if isinstance(value, str):
-#             return value
-#     raise ValueError("MarkItDown result does not contain Markdown text")
-
-
-def _clean_text(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    return "\n".join(line.rstrip() for line in text.split("\n")).strip()
-
-
-def _extract_pdf_text(source: Path) -> tuple[str, int, int]:
+def _make_docling_converter() -> Any:
     try:
-        import pypdfium2 as pdfium
+        import torch
+        from docling.datamodel.accelerator_options import (
+            AcceleratorDevice,
+            AcceleratorOptions,
+        )
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption
     except ImportError as exc:
-        raise RuntimeError("pypdfium2 is required to export PDF files") from exc
+        raise RuntimeError("docling is required to export PDF files") from exc
 
-    document = pdfium.PdfDocument(str(source))
-    try:
-        pages: list[str] = []
-        empty_pages = 0
-        page_count = len(document)
-        for index in range(page_count):
-            page_text = _clean_text(document[index].get_textpage().get_text_range())
-            if not page_text:
-                empty_pages += 1
-            pages.append(f"===== PAGE {index + 1} =====\n{page_text}")
-    finally:
-        close = getattr(document, "close", None)
-        if close is not None:
-            close()
-
-    return "\n\n".join(pages).rstrip() + "\n", page_count, empty_pages
+    device = (
+        AcceleratorDevice.CUDA
+        if torch.cuda.is_available()
+        else AcceleratorDevice.CPU
+    )
+    options = PdfPipelineOptions(
+        accelerator_options=AcceleratorOptions(device=device),
+    )
+    options.do_ocr = False
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=options),
+        }
+    )
 
 
-def _output_suffix(source: Path) -> str:
-    return ".txt" if source.suffix.lower() == _PDF_SUFFIX else ".md"
+def _extract_pdf_docling(
+    source: Path,
+    converter: Any,
+) -> tuple[dict[str, Any], str, int, int, int]:
+    result = converter.convert(str(source))
+    document = result.document
+    data = document.export_to_dict()
+    markdown = document.export_to_markdown()
+
+    page_count = len(data.get("pages", []))
+    texts = data.get("texts", [])
+    tables = data.get("tables", [])
+    character_count = sum(len(item.get("text", "")) for item in texts)
+
+    pages_with_content: set[int] = set()
+    for item in texts + tables:
+        for prov in item.get("prov", []):
+            page_number = prov.get("page_no")
+            if page_number is not None:
+                pages_with_content.add(page_number)
+
+    empty_pages = max(0, page_count - len(pages_with_content))
+    return data, markdown, page_count, empty_pages, character_count
+
+
+def _output_paths(
+    source: Path,
+    input_root: Path,
+    output_root: Path,
+) -> tuple[Path, Path | None]:
+    relative = source.relative_to(input_root)
+    markdown = (output_root / "md" / relative).with_suffix(".md")
+    if source.suffix.lower() == _PDF_SUFFIX:
+        json_path = (output_root / "json" / relative).with_suffix(".json")
+        return markdown, json_path
+    return markdown, None
 
 
 def _converter_name(source: Path) -> str:
     suffix = source.suffix.lower()
     if suffix == _PDF_SUFFIX:
-        return "pypdfium2"
+        return "docling"
     if suffix in _PASSTHROUGH_SUFFIXES:
         return "passthrough"
-    return f"markitdown{suffix}"
+    return ""
 
 
 def _export_one(
     source: Path,
     input_root: Path,
     output_root: Path,
-    converter: Any,
+    docling_converter: Any,
 ) -> dict[str, Any]:
     relative = source.relative_to(input_root)
-    output = (output_root / relative).with_suffix(_output_suffix(source))
-    output.parent.mkdir(parents=True, exist_ok=True)
+    markdown_output, json_output = _output_paths(source, input_root, output_root)
+    markdown_output.parent.mkdir(parents=True, exist_ok=True)
+    if json_output is not None:
+        json_output.parent.mkdir(parents=True, exist_ok=True)
 
     entry: dict[str, Any] = {
         "source_path": relative.as_posix(),
         "source_sha256": _sha256(source),
-        "output_path": output.relative_to(output_root).as_posix(),
+        "output_path": "",
+        "md_path": markdown_output.relative_to(output_root).as_posix(),
+        "json_path": (
+            json_output.relative_to(output_root).as_posix()
+            if json_output is not None
+            else ""
+        ),
         "character_count": 0,
         "page_count": 0,
         "empty_pages": 0,
@@ -123,31 +145,40 @@ def _export_one(
     suffix = source.suffix.lower()
     if suffix in _PASSTHROUGH_SUFFIXES:
         content = source.read_text(encoding="utf-8")
+        markdown_output.write_text(content, encoding="utf-8")
+        entry["output_path"] = entry["md_path"]
         entry["status"] = "copied"
+        entry["character_count"] = len(content)
     elif suffix == _PDF_SUFFIX:
-        content, page_count, empty_pages = _extract_pdf_text(source)
+        if docling_converter is None:
+            raise RuntimeError("docling converter was not initialized")
+        data, markdown, page_count, empty_pages, character_count = _extract_pdf_docling(
+            source,
+            docling_converter,
+        )
+        assert json_output is not None
+        json_output.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        markdown_output.write_text(markdown, encoding="utf-8")
+        entry["output_path"] = entry["json_path"]
         entry["page_count"] = page_count
         entry["empty_pages"] = empty_pages
-        entry["converter_version"] = _package_version("pypdfium2")
-        entry["status"] = "exported" if content.strip() else "empty_output"
+        entry["character_count"] = character_count
+        entry["converter_version"] = _package_version("docling")
+        entry["status"] = (
+            "exported"
+            if data.get("texts") or data.get("tables") or data.get("pictures")
+            else "empty_output"
+        )
         if empty_pages:
-            entry["warning"] = f"{empty_pages} page(s) have no text layer"
-#     elif suffix in _MARKITDOWN_SUFFIXES:
-#         if converter is None:
-#             raise RuntimeError("MarkItDown is not installed")
-#         result = converter.convert_local(str(source))
-#         content = _extract_markdown(result)
-#         entry["converter_version"] = _package_version("markitdown")
-#         entry["status"] = "exported" if content.strip() else "empty_output"
-#         if not content.strip():
-#             entry["warning"] = "MarkItDown returned no text"
+            entry["warning"] = f"{empty_pages} page(s) have no text or table content"
     else:
         entry["status"] = "unsupported"
         entry["warning"] = f"unsupported extension: {suffix or '(none)'}"
         return entry
 
-    output.write_text(content, encoding="utf-8")
-    entry["character_count"] = len(content)
     return entry
 
 
@@ -162,18 +193,12 @@ def export_documents(
     output_root.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # suffix_set = _PASSTHROUGH_SUFFIXES | _MARKITDOWN_SUFFIXES | {_PDF_SUFFIX}
-    # needs_markitdown = any(
-    #     path.is_file() and path.suffix.lower() in _MARKITDOWN_SUFFIXES
-    #     for path in input_root.rglob("*")
-    # )
     suffix_set = _PASSTHROUGH_SUFFIXES | {_PDF_SUFFIX}
-
-    converter = None
-    # if needs_markitdown:
-    #     from markitdown import MarkItDown
-    #
-    #     converter = MarkItDown(enable_plugins=False)
+    needs_docling = any(
+        path.is_file() and path.suffix.lower() == _PDF_SUFFIX
+        for path in input_root.rglob("*")
+    )
+    docling_converter = _make_docling_converter() if needs_docling else None
 
     entries: list[dict[str, Any]] = []
 
@@ -185,6 +210,8 @@ def export_documents(
                     "source_path": relative.as_posix(),
                     "source_sha256": _sha256(source),
                     "output_path": "",
+                    "md_path": "",
+                    "json_path": "",
                     "character_count": 0,
                     "page_count": 0,
                     "empty_pages": 0,
@@ -199,7 +226,9 @@ def export_documents(
             continue
 
         try:
-            entries.append(_export_one(source, input_root, output_root, converter))
+            entries.append(
+                _export_one(source, input_root, output_root, docling_converter)
+            )
         except Exception as exc:
             relative = source.relative_to(input_root)
             entries.append(
@@ -207,6 +236,8 @@ def export_documents(
                     "source_path": relative.as_posix(),
                     "source_sha256": _sha256(source),
                     "output_path": "",
+                    "md_path": "",
+                    "json_path": "",
                     "character_count": 0,
                     "page_count": 0,
                     "empty_pages": 0,

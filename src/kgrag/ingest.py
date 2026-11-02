@@ -31,7 +31,7 @@ _PARENT_RANK_GATE = {
     "chapter": 0,
     "article": 0,
     "clause": 2,
-    "point": 3,
+    "point": 2,
     "subpoint": 4,
     "table": 0,
 }
@@ -578,18 +578,31 @@ def _enrich_metadata(units: list[DocumentUnit], profile: ParserProfile) -> None:
     clause_number = ""
     point_letter = ""
     for unit in units:
-        if unit.level == "article":
+        if unit.level in ("document", "preamble", "chapter"):
+            article_number = ""
+            clause_number = ""
+            point_letter = ""
+        elif unit.level == "article":
             article_number = unit.metadata.get("article_number", "")
+            clause_number = ""
+            point_letter = ""
         elif unit.level == "clause":
             clause_number = unit.metadata.get("clause_number", "")
+            point_letter = ""
         elif unit.level == "point":
             point_letter = unit.metadata.get("point_letter", "")
 
         references: list[Reference] = []
+        seen: set[tuple[str, str]] = set()
         for kind, pattern in crossref_res.items():
             for match in pattern.finditer(unit.text):
+                target = match.group("target")
+                key = (kind, target)
+                if key in seen:
+                    continue
+                seen.add(key)
                 references.append(
-                    Reference(kind=kind, target=match.group(2), text=match.group(0))
+                    Reference(kind=kind, target=target, text=match.group(0))
                 )
         unit.metadata["references"] = [asdict(ref) for ref in references]
 

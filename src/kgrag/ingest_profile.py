@@ -26,6 +26,14 @@ class ParserProfile:
             "muc": ("Mục", "mục"),
         }
     )
+    crossref_targets: dict[str, str] = field(
+        default_factory=lambda: {
+            "dieu": r"\d+[A-Za-z]?(?![^\W_])",
+            "khoan": r"\d+[A-Za-z]?(?![^\W_])",
+            "diem": r"[a-z](?![^\W_])",
+            "muc": r"(?:\d+|[IVXLCDMivxlcdm]+|[a-z])(?![^\W_])",
+        }
+    )
 
     def chapter_re(self) -> re.Pattern[str]:
         tokens = "|".join(re.escape(token) for token in self.chapter_tokens)
@@ -81,9 +89,9 @@ class ParserProfile:
     def crossref_res(self) -> dict[str, re.Pattern[str]]:
         return {
             kind: re.compile(
-                "("
+                r"(?<!\w)("
                 + "|".join(re.escape(term) for term in terms)
-                + r")\s+([a-zA-Z0-9]+)"
+                + rf")\s+(?P<target>{self.crossref_targets[kind]})"
             )
             for kind, terms in self.crossref_terms.items()
         }

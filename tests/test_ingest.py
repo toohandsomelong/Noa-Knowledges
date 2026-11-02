@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -131,6 +132,112 @@ def test_mvp_filter_includes_only_requested_articles():
 def test_crossrefs_extracted(parsed):
     units_with_refs = [u for u in parsed.units if u.metadata.get("references")]
     assert units_with_refs
+
+
+def test_crossrefs_extract_valid_targets():
+    text = "\n".join(
+        [
+            "Điều 1. Tiêu đề",
+            "1. Theo Điều 21, khoản 3, điểm c và Mục II.",
+        ]
+    )
+    result = parse_regulation(text, strict=False)
+    refs = [
+        (ref["kind"], ref["target"])
+        for unit in result.units
+        for ref in unit.metadata.get("references", [])
+    ]
+    assert ("dieu", "21") in refs
+    assert ("khoan", "3") in refs
+    assert ("diem", "c") in refs
+    assert ("muc", "II") in refs
+
+
+def test_crossrefs_ignore_false_positives():
+    text = "\n".join(
+        [
+            "Điều 1. Tiêu đề",
+            "1. Điều kiện áp dụng, Điểm học phần, điểm chữ, khoản này, mục tiêu, mục lục, điểm F, Điểm R, Điểm M, điểm D, điểm I.",
+        ]
+    )
+    result = parse_regulation(text, strict=False)
+    refs = [
+        (ref["kind"], ref["target"])
+        for unit in result.units
+        for ref in unit.metadata.get("references", [])
+    ]
+    assert refs == []
+
+
+def test_crossref_targets_are_well_formed(parsed):
+    patterns = {
+        "dieu": r"\d+[A-Za-z]?",
+        "khoan": r"\d+[A-Za-z]?",
+        "diem": r"[a-z]",
+        "muc": r"(?:\d+|[IVXLCDMivxlcdm]+|[a-z])",
+    }
+    for unit in parsed.units:
+        for ref in unit.metadata.get("references", []):
+            assert re.fullmatch(patterns[ref["kind"]], ref["target"])
+
+
+def test_crossrefs_are_deduplicated_per_unit():
+    text = "\n".join(
+        [
+            "Điều 1. Tiêu đề",
+            "1. Theo Điều 21 và Điều 21.",
+        ]
+    )
+    result = parse_regulation(text, strict=False)
+    refs = [
+        (ref["kind"], ref["target"])
+        for unit in result.units
+        for ref in unit.metadata.get("references", [])
+    ]
+    assert refs == [("dieu", "21")]
+
+
+def test_decision_article_points_are_parsed():
+    result = parse_regulation(load_source_text())
+    article = next(unit for unit in result.units if unit.id == "decision:dieu-2")
+    points = [
+        unit
+        for unit in result.units
+        if unit.parent_id == article.id and unit.level == "point"
+    ]
+    assert [point.metadata["point_letter"] for point in points] == ["a", "b"]
+    assert not any(
+        "line 29" in warning or "line 30" in warning
+        for warning in result.metadata["warnings"]
+    )
+    assert any("line 37" in warning for warning in result.metadata["warnings"])
+
+
+def test_citation_labels_reset_between_articles(parsed):
+    articles = [unit for unit in parsed.units if unit.level == "article"]
+    assert all("khoản" not in unit.citation_label for unit in articles)
+    assert all("điểm" not in unit.citation_label for unit in articles)
+
+
+def test_citation_labels_for_clause_and_point(parsed):
+    article = next(unit for unit in parsed.units if unit.id == "regulation:chuong-i:dieu-2")
+    clause = next(
+        unit
+        for unit in parsed.units
+        if unit.parent_id == article.id
+        and unit.level == "clause"
+        and unit.metadata.get("clause_number") == "7"
+    )
+    point = next(
+        unit
+        for unit in parsed.units
+        if unit.parent_id == clause.id
+        and unit.level == "point"
+        and unit.metadata.get("point_letter") == "a"
+    )
+    assert article.citation_label == "Điều 2"
+    assert clause.citation_label == "Điều 2 khoản 7"
+    assert point.citation_label == "Điều 2 khoản 7 điểm a"
 
 
 def test_chapter_units_exist(parsed):

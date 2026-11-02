@@ -7,12 +7,11 @@ name = "kgrag"
 version = "0.1.0"
 description = "Zero-shot KG-RAG Walk&Retrieve on Vietnamese university regulations"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["requests>=2.32"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
-# export = ["markitdown[docx,pptx,xlsx]>=0.1.0", "pypdfium2>=5.0"]
-export = ["pypdfium2>=5.0"]
+export = ["docling>=2.145.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
