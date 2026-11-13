@@ -245,6 +245,35 @@ def test_chapter_units_exist(parsed):
     assert len(chapters) >= 3
 
 
+def test_document_roots_exist(parsed):
+    roots = {u.id: u for u in parsed.units if u.level == "document"}
+    assert "decision" in roots
+    assert "regulation" in roots
+
+
+def test_document_roots_are_roots(parsed):
+    roots = [u for u in parsed.units if u.level == "document"]
+    assert len(roots) == 2
+    assert all(u.parent_id is None for u in roots)
+
+
+def test_preambles_parented_to_document(parsed):
+    preambles = [u for u in parsed.units if u.level == "preamble"]
+    assert {u.parent_id for u in preambles} == {"decision", "regulation"}
+
+
+def test_chapters_parented_to_document(parsed):
+    chapters = [u for u in parsed.units if u.level == "chapter"]
+    assert all(u.parent_id == "regulation" for u in chapters)
+
+
+def test_decision_articles_parented_to_document(parsed):
+    decision_articles = [
+        u for u in parsed.units if u.level == "article" and u.id.startswith("decision:")
+    ]
+    assert all(u.parent_id == "decision" for u in decision_articles)
+
+
 def test_point_letters_parsed(parsed):
     points = [u for u in parsed.units if u.level == "point"]
     letters = {u.metadata["point_letter"] for u in points}
@@ -253,7 +282,7 @@ def test_point_letters_parsed(parsed):
 
 
 def test_markdown_export_parses_identically():
-    md_path = Path("data/processed/docs/Toàn văn quy chế đào tạo theo tín chỉ.md")
+    md_path = Path("data/processed/docs/md/Toàn văn quy chế đào tạo theo tín chỉ.md")
     txt_result = parse_regulation(load_source_text())
     md_result = parse_source_file(md_path)
 

@@ -23,6 +23,8 @@ class Reference:
     kind: str
     target: str
     text: str
+    start_char: int = 0
+    end_char: int = 0
 
 
 @dataclass

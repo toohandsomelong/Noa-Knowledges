@@ -242,6 +242,7 @@ def parse_regulation(
     units: list[DocumentUnit] = []
     stack: list[DocumentUnit] = []
     orders: dict[tuple[str | None, str], int] = defaultdict(int)
+    document_roots: dict[str, DocumentUnit] = {}
 
     prefix = profile.default_namespace
     pending_chapter: dict[str, Any] | None = None
@@ -256,6 +257,32 @@ def parse_regulation(
         key = (parent_id, level)
         orders[key] += 1
         return orders[key]
+
+    def _get_document_root(ns: str) -> DocumentUnit:
+        if ns in document_roots:
+            return document_roots[ns]
+        unit = DocumentUnit(
+            id=ns,
+            document_id=document_id,
+            level="document",
+            parent_id=None,
+            title=ns,
+            text=ns,
+            context_text=ns,
+            order=_next_order(None, "document"),
+            source_span=SourceSpan(1, 1),
+            source_file=source_file,
+            source_format=source_format,
+            source_hash=source_hash,
+            raw_text=ns,
+            citation_label="",
+            metadata={"document_namespace": ns},
+        )
+        units.append(unit)
+        document_roots[ns] = unit
+        return unit
+
+    _get_document_root(prefix)
 
     def _current_rank() -> int:
         if not stack:
@@ -289,6 +316,8 @@ def parse_regulation(
 
         if parent is None:
             parent = _pop_to(_LEVEL_RANK[level])
+        if parent is None and level != "document":
+            parent = _get_document_root(prefix)
         parent_id = parent.id if parent else None
         order = _next_order(parent_id, level)
 
@@ -354,16 +383,17 @@ def parse_regulation(
             return
         text = " ".join(preamble_lines).strip()
         span = preamble_span or SourceSpan(1, 1)
+        doc_root = _get_document_root(prefix)
         units.append(
             DocumentUnit(
                 id=f"{prefix}:preamble",
                 document_id=document_id,
                 level="preamble",
-                parent_id=None,
+                parent_id=doc_root.id,
                 title="Preamble",
                 text=text,
                 context_text=text,
-                order=_next_order(None, "preamble"),
+                order=_next_order(doc_root.id, "preamble"),
                 source_span=span,
                 source_file=source_file,
                 source_format=source_format,
@@ -427,6 +457,7 @@ def parse_regulation(
             _flush_preamble()
             _close_table()
             stack.clear()
+            _get_document_root(token.value)
             prefix = token.value
             continue
 
@@ -602,7 +633,13 @@ def _enrich_metadata(units: list[DocumentUnit], profile: ParserProfile) -> None:
                     continue
                 seen.add(key)
                 references.append(
-                    Reference(kind=kind, target=target, text=match.group(0))
+                    Reference(
+                        kind=kind,
+                        target=target,
+                        text=match.group(0),
+                        start_char=match.start(),
+                        end_char=match.end(),
+                    )
                 )
         unit.metadata["references"] = [asdict(ref) for ref in references]
 
