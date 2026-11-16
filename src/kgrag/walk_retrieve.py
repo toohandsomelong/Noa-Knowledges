@@ -130,6 +130,11 @@ def _parse_args() -> argparse.Namespace:
         help="Path to verbalizations cache",
     )
     parser.add_argument(
+        "--verbalization-model",
+        default=DEFAULT_CHAT_MODEL,
+        help="Model key used in the verbalization cache",
+    )
+    parser.add_argument(
         "--top-k-nodes",
         type=int,
         default=3,
@@ -191,7 +196,9 @@ def main() -> None:
     if args.build_index:
         walks = load_walks(args.walks)
         cache = VerbalizationCache.load(Path(args.verbalizations))
-        verbalization_map = build_walk_verbalization_map(walks, cache)
+        verbalization_map = build_walk_verbalization_map(
+            walks, cache, model=args.verbalization_model
+        )
         index = build_index(
             walks,
             verbalization_map,

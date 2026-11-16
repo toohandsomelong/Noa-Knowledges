@@ -226,25 +226,30 @@ def retrieve(
         for idx, pos in enumerate(node_positions)
     ]
 
-    walks_by_node: dict[str, list[int]] = defaultdict(list)
-    for pos, start_node in enumerate(index.walk_start_nodes):
-        walks_by_node[start_node].append(pos)
-
+    selected_node_ids = {node["node_id"] for node in nodes}
     selected_walks: list[dict[str, Any]] = []
-    for node in nodes:
-        candidate_positions = walks_by_node.get(node["node_id"], [])
-        if not candidate_positions:
-            continue
-        candidate_scores = index.walk_vectors[candidate_positions] @ query_vector[0]
-        top_indices = np.argsort(candidate_scores)[::-1][:top_k_walks_per_node]
-        for idx in top_indices:
-            pos = candidate_positions[idx]
+    if index.walk_ids:
+        walk_scores, walk_positions = index.walk_index.search(
+            query_vector, len(index.walk_ids)
+        )
+        walk_scores = walk_scores[0]
+        walk_positions = walk_positions[0]
+        kept_per_node: dict[str, int] = defaultdict(int)
+        for score, pos in zip(walk_scores, walk_positions):
+            if pos < 0:
+                continue
+            start_node = index.walk_start_nodes[pos]
+            if start_node not in selected_node_ids:
+                continue
+            if kept_per_node[start_node] >= top_k_walks_per_node:
+                continue
+            kept_per_node[start_node] += 1
             selected_walks.append(
                 {
                     "walk_id": index.walk_ids[pos],
-                    "start_node": node["node_id"],
+                    "start_node": start_node,
                     "text": index.walk_texts[pos],
-                    "score": float(candidate_scores[idx]),
+                    "score": float(score),
                 }
             )
 
