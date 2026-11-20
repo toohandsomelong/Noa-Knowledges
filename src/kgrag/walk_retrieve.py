@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from kgrag.answer_cache import AnswerCache
 from kgrag.providers import DEFAULT_CHAT_MODEL, DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, ChatModel, Embedder, OllamaChat, OllamaEmbedder
 from kgrag.retrieval import build_index, load_index, retrieve
 from kgrag.verbalize import VerbalizationCache, build_walk_verbalization_map
@@ -15,7 +16,7 @@ from kgrag.walks import load_walks
 
 DEFAULT_ABSTAIN_TEXT = "Tôi không biết câu trả lời"
 
-_SYSTEM_PROMPT = (
+SYSTEM_PROMPT = (
     "Bạn là trợ lý trả lời câu hỏi về quy chế đào tạo đại học. "
     "Chỉ sử dụng thông tin trong NGỮ CẢNH dưới đây. "
     "Nếu ngữ cảnh không đủ để trả lời, hãy trả lời đúng: {abstain_text}. "
@@ -24,7 +25,7 @@ _SYSTEM_PROMPT = (
 
 
 def _build_prompt(question: str, context: str, abstain_text: str) -> list[dict[str, str]]:
-    system = _SYSTEM_PROMPT.format(abstain_text=abstain_text)
+    system = SYSTEM_PROMPT.format(abstain_text=abstain_text)
     user = f"NGỮ CẢNH:\n{context}\n\nCÂU HỎI: {question}\n\nTrả lời:"
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -49,8 +50,15 @@ def answer_question(
     top_k_walks_per_node: int = 3,
     max_context_tokens: int = 4096,
     abstain_text: str = DEFAULT_ABSTAIN_TEXT,
+    cache: AnswerCache | None = None,
+    re_cache: bool = False,
 ) -> dict[str, Any]:
     """Answer a single question using Walk&Retrieve."""
+    if cache is not None and not re_cache:
+        cached = cache.get(question)
+        if cached is not None:
+            return cached
+
     index = load_index(index_dir)
     result = retrieve(
         question,
@@ -62,7 +70,7 @@ def answer_question(
     )
 
     if not result["walks"]:
-        return {
+        answer_result = {
             "question": question,
             "answer": abstain_text,
             "abstained": True,
@@ -73,23 +81,26 @@ def answer_question(
             "context_chars": 0,
             "retrieved_walk_scores": {},
         }
+    else:
+        answer = _answer(question, result["context"], chat, abstain_text)
+        abstained = answer.strip() == abstain_text.strip()
+        answer_result = {
+            "question": question,
+            "answer": answer.strip(),
+            "abstained": abstained,
+            "node_ids": [n["node_id"] for n in result["nodes"]],
+            "walk_ids": [w["walk_id"] for w in result["walks"]],
+            "context": result["context"],
+            "context_tokens": result["context_tokens"],
+            "context_chars": result["context_chars"],
+            "retrieved_walk_scores": {
+                w["walk_id"]: round(w["score"], 6) for w in result["walks"]
+            },
+        }
 
-    answer = _answer(question, result["context"], chat, abstain_text)
-    abstained = answer.strip() == abstain_text.strip()
-
-    return {
-        "question": question,
-        "answer": answer.strip(),
-        "abstained": abstained,
-        "node_ids": [n["node_id"] for n in result["nodes"]],
-        "walk_ids": [w["walk_id"] for w in result["walks"]],
-        "context": result["context"],
-        "context_tokens": result["context_tokens"],
-        "context_chars": result["context_chars"],
-        "retrieved_walk_scores": {
-            w["walk_id"]: round(w["score"], 6) for w in result["walks"]
-        },
-    }
+    if cache is not None:
+        cache.add(answer_result)
+    return answer_result
 
 
 def _parse_args() -> argparse.Namespace:
@@ -113,6 +124,21 @@ def _parse_args() -> argparse.Namespace:
         "--out",
         default="artifacts/kg/answers.jsonl",
         help="Output path for batch answers",
+    )
+    parser.add_argument(
+        "--answer-cache",
+        default="artifacts/kg/answers_cache.jsonl",
+        help="Path to the answer cache (JSONL)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable answer caching",
+    )
+    parser.add_argument(
+        "--re-cache",
+        action="store_true",
+        help="Recompute answers and append them to the cache",
     )
     parser.add_argument(
         "--index-dir",
@@ -219,6 +245,10 @@ def main() -> None:
         )
         return
 
+    cache = None
+    if not args.no_cache:
+        cache = AnswerCache.load(Path(args.answer_cache))
+
     questions: list[str] = []
     if args.question:
         questions.append(args.question)
@@ -248,6 +278,8 @@ def main() -> None:
                 top_k_walks_per_node=args.top_k_walks_per_node,
                 max_context_tokens=args.max_context_tokens,
                 abstain_text=args.abstain_text,
+                cache=cache,
+                re_cache=args.re_cache,
             )
             handle.write(json.dumps(result, ensure_ascii=False))
             handle.write("\n")

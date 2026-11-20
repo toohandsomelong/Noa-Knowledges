@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -14,6 +13,7 @@ from typing import Any, Sequence
 from kgrag.ingest_normalize import NormalizedLine, normalize_text
 from kgrag.ingest_profile import ParserProfile, vietnamese_regulation_profile
 from kgrag.schemas import DocumentUnit, ParseResult, Reference, SourceSpan
+from kgrag.utils import sha256_file
 
 _LEVEL_RANK = {
     "document": 0,
@@ -43,14 +43,6 @@ class _Token:
     value: str
     text: str
     line: NormalizedLine
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _slug(value: str) -> str:
@@ -110,7 +102,7 @@ def load_source(
     path = Path(path)
     text = path.read_text(encoding="utf-8")
     source_format = path.suffix.lower().lstrip(".") or "txt"
-    source_hash = _sha256_file(path)
+    source_hash = sha256_file(path)
     return text, path, source_format, source_hash
 
 
@@ -571,22 +563,25 @@ def parse_regulation(
     return ParseResult(document_id=document_id, units=units, metadata=metadata)
 
 
+def _parent_units(
+    unit: DocumentUnit, by_id: dict[str, DocumentUnit]
+) -> list[DocumentUnit]:
+    result: list[DocumentUnit] = []
+    current = by_id.get(unit.parent_id) if unit.parent_id else None
+    while current is not None:
+        result.insert(0, current)
+        current = by_id.get(current.parent_id) if current.parent_id else None
+    return result
+
+
 def _build_context_text(units: list[DocumentUnit]) -> None:
     by_id = {u.id: u for u in units}
 
-    def _ancestors(unit: DocumentUnit) -> list[DocumentUnit]:
-        result = []
-        current = by_id.get(unit.parent_id) if unit.parent_id else None
-        while current is not None:
-            result.insert(0, current)
-            current = by_id.get(current.parent_id) if current.parent_id else None
-        return result
-
     for unit in units:
-        ancestors = _ancestors(unit)
+        parent_units = _parent_units(unit, by_id)
         context_lines = [
             u.title or u.text
-            for u in ancestors
+            for u in parent_units
             if u.level in ("chapter", "article", "clause", "point")
         ]
         context_lines.append(unit.title or unit.text)
@@ -596,14 +591,6 @@ def _build_context_text(units: list[DocumentUnit]) -> None:
 def _enrich_metadata(units: list[DocumentUnit], profile: ParserProfile) -> None:
     crossref_res = profile.crossref_res()
     by_id = {u.id: u for u in units}
-
-    def _ancestors(unit: DocumentUnit) -> list[DocumentUnit]:
-        result = []
-        current = by_id.get(unit.parent_id) if unit.parent_id else None
-        while current is not None:
-            result.insert(0, current)
-            current = by_id.get(current.parent_id) if current.parent_id else None
-        return result
 
     article_number = ""
     clause_number = ""
@@ -653,9 +640,9 @@ def _enrich_metadata(units: list[DocumentUnit], profile: ParserProfile) -> None:
         unit.citation_label = " ".join(label_parts)
 
         if not unit.citation_label:
-            ancestors = _ancestors(unit)
+            parent_units = _parent_units(unit, by_id)
             nearest = next(
-                (a for a in reversed(ancestors) if a.citation_label),
+                (a for a in reversed(parent_units) if a.citation_label),
                 None,
             )
             if nearest:

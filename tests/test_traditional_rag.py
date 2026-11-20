@@ -10,7 +10,6 @@ from kgrag.providers import FakeChat, FakeEmbedder
 from kgrag.traditional_rag import (
     CHUNKER_VERSION,
     Chunk,
-    _SYSTEM_PROMPT,
     answer_question,
     build_chunk_index,
     build_chunks,
@@ -200,12 +199,6 @@ def test_answer_question_detects_abstain_text(tmp_path):
     )
     assert result["answer"] == abstain
     assert result["abstained"] is True
-
-
-def test_prompt_matches_walk_retrieve():
-    from kgrag.walk_retrieve import _SYSTEM_PROMPT as walk_prompt
-
-    assert _SYSTEM_PROMPT == walk_prompt
 
 
 class _UnexpectedChat:

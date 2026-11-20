@@ -7,7 +7,7 @@ import json
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import faiss
 import numpy as np
@@ -23,6 +23,7 @@ from kgrag.providers import (
     OllamaEmbedder,
 )
 from kgrag.schemas import DocumentUnit
+from kgrag.utils import embed_batch, l2_normalize, token_count, truncate_to_tokens
 from kgrag.walk_retrieve import DEFAULT_ABSTAIN_TEXT
 
 CHUNKER_VERSION = "clause-subtree-v1"
@@ -176,27 +177,6 @@ class ChunkIndex:
     metadata: dict[str, Any]
 
 
-def _l2_normalize(vectors: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return vectors / norms
-
-
-def _embed_batch(
-    texts: Sequence[str],
-    embedder: Embedder,
-    batch_size: int = 16,
-) -> np.ndarray:
-    vectors: list[np.ndarray] = []
-    for i in range(0, len(texts), batch_size):
-        batch = list(texts[i : i + batch_size])
-        batch_vectors = embedder.embed(batch)
-        vectors.append(np.asarray(batch_vectors, dtype=np.float32))
-    if not vectors:
-        return np.zeros((0, 0), dtype=np.float32)
-    return np.vstack(vectors)
-
-
 def build_chunk_index(
     chunks: list[Chunk],
     embedder: Embedder,
@@ -212,8 +192,8 @@ def build_chunk_index(
 
     chunk_ids = [chunk.chunk_id for chunk in chunks]
     texts = [chunk.text for chunk in chunks]
-    vectors = _l2_normalize(
-        _embed_batch(texts, embedder, batch_size=embed_batch_size)
+    vectors = l2_normalize(
+        embed_batch(texts, embedder, batch_size=embed_batch_size)
     )
 
     dim = vectors.shape[1]
@@ -268,17 +248,6 @@ def load_chunk_index(index_dir: str | Path) -> ChunkIndex:
     )
 
 
-def _token_count(text: str) -> int:
-    return len(text.split())
-
-
-def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-    tokens = text.split()
-    if len(tokens) <= max_tokens:
-        return text
-    return " ".join(tokens[:max_tokens])
-
-
 def retrieve_chunks(
     query: str,
     index: ChunkIndex,
@@ -298,7 +267,7 @@ def retrieve_chunks(
             "retrieved_chunk_count": 0,
         }
 
-    query_vector = _l2_normalize(
+    query_vector = l2_normalize(
         np.asarray(embedder.embed([query]), dtype=np.float32)
     )
     scores, positions = index.index.search(
@@ -323,13 +292,13 @@ def retrieve_chunks(
     context_tokens = 0
     kept_chunks: list[dict[str, Any]] = []
     for chunk in chunks:
-        tokens = _token_count(chunk["text"])
+        tokens = token_count(chunk["text"])
         if context_tokens + tokens > max_context_tokens and context_parts:
             break
         available = max_context_tokens - context_tokens
-        part = _truncate_to_tokens(chunk["text"], available)
+        part = truncate_to_tokens(chunk["text"], available)
         context_parts.append(part)
-        context_tokens += _token_count(part)
+        context_tokens += token_count(part)
         kept_chunks.append(chunk)
 
     context = "\n\n".join(context_parts)

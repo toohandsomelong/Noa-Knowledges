@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
+
+from kgrag.utils import sha256_file
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_INPUT = _REPO_ROOT / "data" / "docs"
@@ -17,14 +18,6 @@ _DEFAULT_MANIFEST = _REPO_ROOT / "data" / "processed" / "docs_manifest.jsonl"
 
 _PASSTHROUGH_SUFFIXES = {".txt", ".md"}
 _PDF_SUFFIX = ".pdf"
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _package_version(name: str) -> str:
@@ -124,7 +117,7 @@ def _export_one(
 
     entry: dict[str, Any] = {
         "source_path": relative.as_posix(),
-        "source_sha256": _sha256(source),
+        "source_sha256": sha256_file(source),
         "output_path": "",
         "md_path": markdown_output.relative_to(output_root).as_posix(),
         "json_path": (
@@ -208,7 +201,7 @@ def export_documents(
             entries.append(
                 {
                     "source_path": relative.as_posix(),
-                    "source_sha256": _sha256(source),
+                    "source_sha256": sha256_file(source),
                     "output_path": "",
                     "md_path": "",
                     "json_path": "",
@@ -234,7 +227,7 @@ def export_documents(
             entries.append(
                 {
                     "source_path": relative.as_posix(),
-                    "source_sha256": _sha256(source),
+                    "source_sha256": sha256_file(source),
                     "output_path": "",
                     "md_path": "",
                     "json_path": "",
